@@ -1,0 +1,95 @@
+Always on AG Health Check Report -- Author: Dinesh Kumar
+--https://www.sqlservercentral.com/scripts/always-on-ag-dashboard-report
+============================================================================================================
+T-SQL script which will trigger the Dashboard report whenever there is an issue with any of the node either Primary or Secondary. 
+To schedule this script, Place it in SQL agent job.
+============================================================================================================
+This job should be configured on all primary and secondary nodes. 
+This job will run on all nodes and check whether there is any issue with any of the database(s) or node(s) on all primary and secondary nodes. 
+If it founds anything wrong like database is in “not synchronizing” state, in such cases, this job will trigger the email to recipient(s). 
+This email will carry the AG Dashboard report which will tell us about the status of all database(s) and node(s) belongs to the different AG’s.
+============================================================================================================
+This script is divided in two different parts. 
+First part will check whether the current node is Primary, 
+If current node is primary then execution will go to the second part 
+otherwise it will complete without generating any report. 
+In my environment, I have configured a 2 steps(separate step for each part) job which runs in every 15 mins.
+============================================================================================================
+
+First script:
+============
+use master
+go
+Declare @databasename varchar(250)
+SET @databasename =(Select DISTINCT Top 1 d.name from sys.databases d 
+INNER JOIN master.sys.dm_hadr_database_replica_states drs
+on d.replica_id = drs.replica_id)
+
+if sys.fn_hadr_is_primary_replica (@databasename) <> 1
+Begin
+RAISERROR('This is not preferred primary replica',1,1)
+END
+
+
+Second scrpt:
+============
+USE master
+GO
+DECLARE @DB_count  int
+DECLARE @tableHTML  NVARCHAR(MAX) ;  
+ 
+SET @tableHTML =
+N'<p> Hi Team </p>'+
+N'<p> Some of the node(s) is/are not healthy. Please use following Database Availability report to find node/database name.</>'+    
+    N'<H1> AG Databases Availability Report</H1>' +  
+    N'<table border="1">' +  
+    N'<tr><th> Availability Group </th><th> Server Name </th><th> Database Name </th>' +  
+    N'<th> DB Synchronization State </th><th> Node health desc </th><th> log reuse wait desc </th><th> Last Commit time </th> </tr>' +  
+    
+    CAST ( ( SELECT td = ag.name, ' ',
+   td = arcs.replica_server_name,' ',
+   td = d.name,' ',
+   td = drs.synchronization_state_desc, ' ',
+   td = drs.synchronization_health_desc, ' ',
+   td = d.log_reuse_wait_desc,' ',
+   td = Convert(nvarchar,drs.last_commit_time,20)
+FROM master.sys.databases d
+INNER JOIN master.sys.dm_hadr_database_replica_states drs
+ON d.database_id=drs.database_id
+INNER JOIN master.sys.dm_hadr_availability_replica_cluster_states arcs
+ON drs.replica_id=arcs.replica_id
+INNER JOIN master.sys.availability_groups ag
+ON ag.group_id=drs.group_id
+ORDER BY arcs.replica_server_name ASC 
+  
+               
+              FOR XML PATH('tr'), TYPE   
+    ) AS NVARCHAR(MAX) ) +  
+    N'</table>' ;
+
+Set @DB_count = (Select count(drs.synchronization_health_desc)
+FROM master.sys.databases d
+INNER JOIN master.sys.dm_hadr_database_replica_states drs
+ON d.database_id=drs.database_id
+INNER JOIN master.sys.dm_hadr_availability_replica_cluster_states arcs
+ON drs.replica_id=arcs.replica_id
+where drs.synchronization_health_desc NOT LIKE 'HEALTHY' OR drs.synchronization_state_desc NOT IN ('SYNCHRONIZED','SYNCHRONIZING'))
+
+
+IF @DB_count > 0
+
+EXEC msdb.dbo.sp_send_dbmail 
+
+  @profile_name='SQL Server Profile Name',
+  @recipients= 'Recipients email id',
+  @importance = 'High',
+  @subject = 'CRITICAL-Node(s) is/are unhealthy',
+  @body = @tableHTML,
+  @body_format = 'HTML';
+ 
+else
+
+Print 'All nodes are healthy'
+   
+
+GO
