@@ -1,0 +1,97 @@
+Source: https://sqlundercover.com/2017/09/19/7-ways-to-query-always-on-availability-groups-using-sql/
+
+Show Availability groups visible to the Server and Replica information such as Which server is the Primary replica, Sync and Async modes , Readable Secondary and Failover Mode
+
+--Show Availability groups visible to the Server and Replica information such as Which server is the Primary
+--Sync and Async modes , Readable Secondary and Failover Mode, these can all be filtered using a Where clause
+--if you are running some checks, no Where clause will show you all of the information.
+
+WITH AGStatus AS(
+SELECT
+name as AGname,
+replica_server_name,
+CASE WHEN  (primary_replica  = replica_server_name) THEN  1
+ELSE  '' END AS IsPrimaryServer,
+secondary_role_allow_connections_desc AS ReadableSecondary,
+[availability_mode]  AS [Synchronous],
+failover_mode_desc
+FROM master.sys.availability_groups Groups
+INNER JOIN master.sys.availability_replicas Replicas ON Groups.group_id = Replicas.group_id
+INNER JOIN master.sys.dm_hadr_availability_group_states States ON Groups.group_id = States.group_id
+)
+Select
+[AGname],
+[Replica_server_name],
+[IsPrimaryServer],
+[Synchronous],
+[ReadableSecondary],
+[Failover_mode_desc]
+FROM AGStatus
+--WHERE
+--IsPrimaryServer = 1
+--AND Synchronous = 1
+ORDER BY
+AGname ASC,
+IsPrimaryServer DESC;
+
+ 
+
+Show All availability groups visible to this server where this Server is the Primary replica
+
+SELECT Groups.[Name] AS AGname
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+WHERE primary_replica = @@Servername;
+
+ 
+
+Show All availability groups visible to this server where this Server is a Secondary replica
+
+SELECT Groups.[Name] AS AGname
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+WHERE primary_replica != @@Servername;
+
+ 
+
+Show All Databases in an availability group visible to this server where this Server is the primary replica
+
+SELECT
+Groups.[Name] AS AGname,
+AGDatabases.database_name AS Databasename
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+INNER JOIN sys.availability_databases_cluster AGDatabases ON Groups.group_id = AGDatabases.group_id
+WHERE primary_replica = @@Servername
+ORDER BY
+AGname ASC,
+Databasename ASC;
+
+ 
+
+Show All Databases in an availability group visible to this server where this Server is a Secondary replica
+
+SELECT
+Groups.[Name] AS AGname,
+AGDatabases.database_name AS Databasename
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+INNER JOIN sys.availability_databases_cluster AGDatabases ON Groups.group_id = AGDatabases.group_id
+WHERE primary_replica != @@Servername
+ORDER BY
+AGname ASC,
+Databasename ASC;
+
+ 
+
+Show All Databases Across all Availability groups within the Cluster (not specific to current server)
+
+SELECT  Groups.[name] AS AGName ,
+Databaselist.[database_name] AS DatabaseName
+FROM    sys.availability_databases_cluster Databaselist
+INNER JOIN sys.availability_groups_cluster Groups ON Databaselist.group_id = Groups.group_id
+ORDER BY
+AGName ,
+DatabaseName;
+
+ 
