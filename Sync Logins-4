@@ -1,0 +1,26 @@
+Powershell Job Code
+
+https://ryanjadams.com/2017/06/sync-sql-logins/
+
+# This script creates a job to copy and sync all logins in a 3 node Availability Group test environment.
+# User accepts all risks.  Always test in a test environment first.
+# Ryan J. Adams
+# https://www.ryanjadams.com/go/AGSync
+ 
+Import-Module SQLPS -DisableNameChecking
+$AGName = "App1AG"
+$server = New-Object Microsoft.SqlServer.Management.Smo.Server
+$AGPrimary = $Server.AvailabilityGroups[$AGName].DatabaseReplicaStates | Where-Object {$_.ReplicaRole -eq "Primary"} | Select-object -property AvailabilityReplicaServerName -First 1
+ 
+#Write-Host $AGPrimary.AvailabilityReplicaServerName
+#write-host $env:COMPUTERNAME
+ 
+If ($AGPrimary.AvailabilityReplicaServerName -eq $env:COMPUTERNAME) {
+ 
+    Copy-SqlLogin -Source Node1 -Destination Node2
+    Sync-SqlLoginPermissions -source Node1 -destination Node2
+     
+    Copy-SqlLogin -Source Node1 -Destination Node3
+    Sync-SqlLoginPermissions -source Node1 -destination Node3}
+ 
+Else {Exit}
