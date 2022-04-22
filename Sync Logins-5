@@ -1,0 +1,373 @@
+https://maq.guru/synchronizing-sql-server-logins-in-an-always-on-availability-group/
+Author: Muhammad Qadeer
+====================================================================================================================
+Synchronizing SQL Server Logins in an Always On Availability Group
+Always On Availability Group is not a new feature, released in SQL Server 2012. 
+Always On Availability Group “claims” to provide a high availability and disaster recovery solution. 
+That is not 100% correct, as it does not provide HADR to many system objects e.g. SQL Agent jobs, SQL Server logins, Linked Servers etc.
+If you forget to create SQL Server logins or update passwords/permissions on secondary replicas and a failover occurs 
+users/apps will not have access to the “new” primary replica.
+====================================================================================================================
+One of our clients had the same issue. I have implemented a solution using the power of PowerShell to resolve it.
+In this solution, a SQL Agent job executes a PowerShell script on the Primary replica that takes care of new logins and password/permission change. 
+Although, the job exists on all nodes but it is smart enough to know which node it should execute on.
+
+As soon as the new login creation or password/permission change event occurs, the script replicates it on all secondary nodes.
+=========================================================================================================================
+Limitations: The script will not copy existing logins unless you make a change to them e.g. password change, grant/revoke privileges etc.
+
+Prerequisites:
+“sp_hexadecimal” should be deployed on all cluster nodes.
+Remember to remove/comment out “Write-Host” statements if running as SQL Agent Job
+Script will not do anything if you did not modify or created a login
+
+References: TSQL script based upon “sp_hexadecimal” by Microsoft and TSQL to get the “create login” script based upon Claire Hsu
+====================================================================================================================================
+
+$Conn=New-Object System.Data.SqlClient.SQLConnection
+$QueryTimeout = 120
+$ConnectionTimeout = 30
+
+###########################################################
+# Execute Query function 
+###########################################################
+Function executequery($Query, $QueryTimeout, $ServerName)
+{
+    $Datatable = New-Object System.Data.DataTable
+	$ConnectionString = "Server={0};Database={1};Integrated Security=True;Connect Timeout={2}" -f $ServerName,$Database,$ConnectionTimeout
+	$Conn.ConnectionString=$ConnectionString
+    $Cmd=New-Object system.Data.SqlClient.SqlCommand($Query,$Conn)
+    $Cmd.CommandTimeout=$QueryTimeout
+    
+	        do
+	            {	
+                    $Conn.Open()
+		            Start-Sleep -Seconds 2
+	            }while ($Conn.State -ne 'Open')
+
+	        $Reader = $cmd.ExecuteReader()
+            $Datatable.Load($Reader)
+            $Conn.Close()
+    	    return $Datatable	 
+}
+
+
+###########################################################
+# Create spHexaDecimal Stored Procedure
+###########################################################
+
+Function CreatespHexaDecimal ($ServerName)
+    {
+    $Query='USE [master];
+                GO
+                SET ANSI_NULLS ON;
+                GO
+                SET QUOTED_IDENTIFIER ON;
+                GO
+                CREATE PROCEDURE [dbo].[spHexaDecimal]
+	            (
+	                @BinValue VARBINARY(256)
+	                , @HexValue VARCHAR(514) OUTPUT
+	            )
+                AS
+
+                DECLARE @CharValue VARCHAR(514)
+                DECLARE @i INT
+                DECLARE @Length INT
+                DECLARE @HexString CHAR(16)
+
+                SET @CharValue = ''0x''
+                SET @i = 1
+                SET @Length = DATALENGTH(@BinValue)
+                SET @HexString = ''0123456789ABCDEF''
+
+                WHILE (@i <= @Length)
+                BEGIN
+
+	                DECLARE @TempInt INT
+	                DECLARE @FirstInt INT
+	                DECLARE @SecondInt INT
+	
+	                SET @TempInt = CONVERT(INT, SUBSTRING(@BinValue, @i, 1))
+	                SET @FirstInt = FLOOR(@TempInt/16)
+	                SET @SecondInt = @TempInt - (@FirstInt * 16)
+	                SET @CharValue = @CharValue 
+						                + SUBSTRING(@HexString, @FirstInt + 1, 1)
+						                + SUBSTRING(@HexString, @SecondInt + 1, 1)
+
+	                SET @i = @i + 1
+
+                END --WHILE (@i <= @Length)
+
+                SET @HexValue = @CharValue'
+
+                Invoke-Sqlcmd -Query $Query -ServerInstance $ServerName
+    }
+
+
+###########################################################
+# CheckStroedProc 
+###########################################################
+
+Function CheckStoredProc ($Server)
+{
+    $Query= 'SELECT 1 AS ExistCheck
+             FROM   sysobjects 
+             WHERE  id = object_id(N''[dbo].[spHexaDecimal]'') 
+                 AND OBJECTPROPERTY(id, N''IsProcedure'') = 1 '
+
+    $Result=executequery $Query $QueryTimeout $Server
+    $Exist=$Result | SELECT -ExpandProperty ExistCheck
+    IF ($Exist -ne 1)
+        {
+            CreatespHexaDecimal -ServerName $Server
+        }
+}
+
+###########################################################
+# Get Login Script
+###########################################################
+
+Function Get-Script ($Server)
+{
+
+$Query='DECLARE @TempTable TABLE
+(Script NVARCHAR(MAX))
+DECLARE @Login NVARCHAR (MAX)
+DECLARE CURLOGIN CURSOR FOR
+SELECT name 
+FROM sys.server_principals
+WHERE CONVERT(VARCHAR(24),create_date,103) = CONVERT(VARCHAR(24),GETDATE(),103)
+	OR CONVERT(VARCHAR(24),modify_date,103) = CONVERT(VARCHAR(24),GETDATE(),103)
+
+OPEN CURLOGIN
+	FETCH NEXT FROM CURLOGIN INTO @Login
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+	SET NOCOUNT ON
+	DECLARE @Script NVARCHAR (MAX)
+	DECLARE @LoginName VARCHAR(500)= @Login
+	DECLARE @LoginSID VARBINARY(85)
+	DECLARE @SID_String VARCHAR(514)
+	DECLARE @LoginPWD VARBINARY(256)
+	DECLARE @PWD_String VARCHAR(514)
+	DECLARE @LoginType CHAR(1)
+	DECLARE @is_disabled BIT
+	DECLARE @default_database_name SYSNAME
+	DECLARE @default_language_name SYSNAME
+	DECLARE @is_policy_checked BIT
+	DECLARE @is_expiration_checked BIT
+	DECLARE @createdDateTime DATETIME
+
+
+
+	SELECT @LoginSID = P.[sid]
+		, @LoginType = P.[type]
+		, @is_disabled = P.is_disabled 
+		, @default_database_name = P.default_database_name 
+		, @default_language_name = P.default_language_name 
+		, @createdDateTime = P.create_date 
+	FROM sys.server_principals P
+	WHERE P.name = @LoginName
+
+	/** Some Output **/
+	SET @Script = ''''
+
+
+
+
+	--If the login is a SQL Login, then do a lot of stuff...
+	IF @LoginType = ''S''
+	BEGIN
+	
+		SET @LoginPWD = CAST(LOGINPROPERTY(@LoginName, ''PasswordHash'') AS VARBINARY(256))
+	
+		EXEC spHexaDecimal @LoginPWD, @PWD_String OUT	
+		EXEC spHexaDecimal @LoginSID, @SID_String OUT
+	
+		SELECT @is_policy_checked = S.is_policy_checked
+			, @is_expiration_checked = S.is_expiration_checked
+		FROM sys.sql_logins S
+	
+		/** Create Script **/
+		SET @Script = @Script + CHAR(13) + CHAR(13)
+						+ ''IF EXISTS (SELECT name FROM sys.server_principals WHERE name= ''''''+ @LoginName + '''''') '' 
+						+ CHAR(13) + '' BEGIN ''
+						+ CHAR(13) + CHAR(9) + '' ALTER LOGIN '' + QUOTENAME(@LoginName)
+						+ CHAR(13) + CHAR(9) + ''WITH PASSWORD = '' + @PWD_String + '' HASHED''
+						+ CHAR(13) + CHAR(9) + '', DEFAULT_DATABASE = ['' + @default_database_name + '']''
+						+ CHAR(13) + CHAR(9) + '', DEFAULT_LANGUAGE = ['' + @default_language_name + '']''
+						+ CHAR(13) + CHAR(9) + '', CHECK_POLICY '' + CASE WHEN @is_policy_checked = 0 THEN ''=OFF'' ELSE ''=ON'' END
+						+ CHAR(13) + CHAR(9) + '', CHECK_EXPIRATION '' + CASE WHEN @is_expiration_checked = 0 THEN ''=OFF'' ELSE ''=ON'' END
+						+ CHAR(13) + '' END ''
+						+ CHAR(13) + ''ELSE''
+						+ CHAR(13) + '' BEGIN ''
+						+ CHAR(13) + CHAR(9) + '' CREATE LOGIN '' + QUOTENAME(@LoginName)
+						+ CHAR(13) + CHAR(9) + ''WITH PASSWORD = '' + @PWD_String + '' HASHED''
+						+ CHAR(13) + CHAR(9) + '', SID = '' + @SID_String
+						+ CHAR(13) + CHAR(9) + '', DEFAULT_DATABASE = ['' + @default_database_name + '']''
+						+ CHAR(13) + CHAR(9) + '', DEFAULT_LANGUAGE = ['' + @default_language_name + '']''
+						+ CHAR(13) + CHAR(9) + '', CHECK_POLICY '' + CASE WHEN @is_policy_checked = 0 THEN ''=OFF'' ELSE ''=ON'' END
+						+ CHAR(13) + CHAR(9) + '', CHECK_EXPIRATION '' + CASE WHEN @is_expiration_checked = 0 THEN ''=OFF'' ELSE ''=ON'' END
+						+ CHAR(13) + '' END ''
+					
+		SET @Script = @Script + CHAR(13) + CHAR(13)
+						+ '' ALTER LOGIN ['' + @LoginName + '']''
+						+ CHAR(13) + CHAR(9) + ''WITH DEFAULT_DATABASE = ['' + @default_database_name + '']''
+						+ CHAR(13) + CHAR(9) + '', DEFAULT_LANGUAGE = ['' + @default_language_name + '']''
+		
+	END
+	ELSE
+	BEGIN
+
+		--The login is a NT login (or group).
+		SET @Script = @Script + CHAR(13) + CHAR(13)
+						+ ''IF NOT EXISTS (SELECT name FROM sys.server_principals WHERE name= ''''''+ @LoginName + '''''') '' 
+						+ CHAR(13) + '' BEGIN ''
+						+ CHAR(13) + CHAR(9) + '' CREATE LOGIN '' + QUOTENAME(@LoginName) + '' FROM WINDOWS''
+						+ CHAR(13) + CHAR(9) + ''WITH DEFAULT_DATABASE = ['' + @default_database_name + '']''
+						+ CHAR(13) + '' END ''
+	END
+
+	/******************************************************************************************/
+	--This section deals with the Server Roles that belong to that login...
+	/******************************************************************************************/
+
+	DECLARE @ServerRoles TABLE
+		(
+		ServerRole SYSNAME
+		, MemberName SYSNAME
+		, MemberSID VARBINARY(85)
+		)
+	
+	INSERT INTO @ServerRoles EXEC sp_helpsrvrolemember
+
+	--Remove all Roles
+	SET @Script = @Script + CHAR(13)
+	SET @Script = @Script 
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''sysadmin''''''
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''securityadmin''''''
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''serveradmin'''''' 
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''setupadmin'''''' 
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''processadmin''''''
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''diskadmin'''''' 
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''dbcreator'''''' 
+							+ CHAR(13) + ''EXEC sp_dropsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + ''''''bulkadmin'''''' 
+
+	/** Output to script... **/
+	--SET @Script = @Script + CHAR(13) + CHAR(13)
+
+	--Test if there are any server roles for this login...
+	IF EXISTS(SELECT 1 FROM @ServerRoles WHERE MemberName = @LoginName)
+	BEGIN
+
+		SET @Script = @Script + CHAR(13)
+
+		DECLARE @ServerRole SYSNAME
+		DECLARE curRoles CURSOR LOCAL STATIC FORWARD_ONLY
+	
+		FOR SELECT ServerRole 
+			FROM @ServerRoles
+			WHERE MemberName = @LoginName
+		
+		OPEN curRoles
+	
+		FETCH NEXT FROM curRoles
+		INTO @ServerRole
+	
+		WHILE @@FETCH_STATUS = 0
+		BEGIN
+	
+			/** Output to Script **/
+			SET @Script = @Script 
+							+ CHAR(13) + ''EXEC sp_addsrvrolemember '' + QUOTENAME(@LoginName, '''''''') + '', '' + QUOTENAME(@ServerRole, '''''''')
+	
+			FETCH NEXT FROM curRoles
+			INTO @ServerRole
+		
+		END
+	
+		--Cleanup.
+		CLOSE curRoles
+		DEALLOCATE curRoles
+
+	END
+	INSERT INTO @TempTable
+	VALUES(@Script)
+
+	FETCH NEXT FROM CURLOGIN INTO @Login
+END
+CLOSE CURLOGIN;
+DEALLOCATE CURLOGIN;
+SELECT Script FROM @TempTable'
+
+$Result=executequery $Query $QueryTimeout $Server
+
+If($Result -eq $null)
+    {
+        break
+    }
+Else
+    {
+        [Void][System.IO.Directory]::CreateDirectory("C:\temp")
+        $Path = "C:\temp"
+        $Acl = (Get-Item $Path).GetAccessControl('Access')
+        $Username = Get-WmiObject win32_service | Where name -EQ 'SQLSERVERAGENT' | Select -ExpandProperty StartName
+        $Ar = New-Object System.Security.AccessControl.FileSystemAccessRule($Username, 'Full', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $Acl.SetAccessRule($Ar)
+        Set-Acl -path $Path -AclObject $Acl
+        $Result | select -ExpandProperty Script | Out-File C:\temp\Script.txt
+    }
+}
+
+
+###########################################################
+# SCRIPT BODY 
+###########################################################
+
+$Query= "SELECT ISNULL(SERVERPROPERTY ('InstanceName'), 'DEFAULT') InstanceName 
+            , name AGName
+            , replica_server_name Replica
+            , role_desc 
+            FROM sys.dm_hadr_availability_replica_states hars 
+            INNER JOIN sys.availability_groups ag ON ag.group_id = hars.group_id 
+            INNER JOIN sys.availability_replicas ar ON ar.replica_id = hars.replica_id
+            WHERE role_desc = 'PRIMARY'
+            ORDER BY role_desc asc"
+Write-Host "Is this Primary Replica?"
+$Result=executequery $Query $QueryTimeout $PrimaryReplica
+If ($Result -eq $null)
+    {
+        Write-Host "No, it's not."
+        break
+    }
+Else
+    {
+        Write-Host "Yes, it is."
+        $PrimaryReplica= $Result | select -ExpandProperty Replica
+        Write-Host "Check for prerequisite, if not present deploy it."
+        CheckStoredProc -Server $PrimaryReplica
+        Write-Host "Get script for new/modifies login(s)."
+        Get-Script -Server $PrimaryReplica
+
+        $Query= "SELECT ISNULL(SERVERPROPERTY ('InstanceName'), 'DEFAULT') InstanceName 
+                    , name AGName
+                    , replica_server_name Replica
+                    , role_desc 
+                    FROM sys.dm_hadr_availability_replica_states hars 
+                    INNER JOIN sys.availability_groups ag ON ag.group_id = hars.group_id 
+                    INNER JOIN sys.availability_replicas ar ON ar.replica_id = hars.replica_id
+                    WHERE role_desc = 'SECONDARY'
+                    ORDER BY role_desc asc"
+
+        $Result=executequery $Query $QueryTimeout $PrimaryReplica
+        $SecondaryReplicas= $Result | select -ExpandProperty Replica
+        $Query= Get-Content -Path 'C:\temp\Script.txt' | Out-String
+        ForEach($SecondaryReplica in $SecondaryReplicas)
+            {
+                Invoke-Sqlcmd -Query $Query -ServerInstance $SecondaryReplica
+                Write-Host "Successfully copied login(s) to $SecondaryReplica"
+            }
+        Remove-Item C:\temp\Script.txt
+    }
