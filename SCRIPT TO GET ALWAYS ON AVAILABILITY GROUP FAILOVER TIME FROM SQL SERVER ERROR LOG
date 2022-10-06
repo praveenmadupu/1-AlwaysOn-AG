@@ -1,0 +1,14 @@
+SCRIPT TO GET ALWAYS ON AVAILABILITY GROUP FAILOVER TIME FROM SQL SERVER ERROR LOG
+--https://jbswiki.com/2020/01/07/script-to-get-always-on-availability-group-failover-time-from-sql-server-error-log/
+
+-> Below script can be used to get Always On Availability group failover time from current SQL Server error log.
+
+sp_readerrorlog 0,1,'The state of the local availability replica','JBAG'
+
+From the above command,
+
+sp_readerrorlog is the command.
+0 refers to current SQL Server error log file. Increment this value to check old logs.
+1 refers to SQL Server error log.
+“The state of the local availability replica“ refers to search string 1.
+“JBAG” refers to search string 2. I have used the name of availability group for which I am checking the failover time.
