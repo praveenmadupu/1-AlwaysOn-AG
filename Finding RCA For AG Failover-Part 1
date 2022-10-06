@@ -1,0 +1,318 @@
+Finding RCA For AG Failover-Part 1
+--https://sqltechuniverse.wordpress.com/2020/12/31/finding-rca-for-ag-failover-part-1/
+--AlwaysOn Queries
+
+As you all aware we have multiple ways to query availability group information,
+below are some of useful queries which helps to gather information about Always on Availability groups, failover readiness, status change etc.
+
+1. The below script would help to get the Failover Readiness in Primary instance
+=================================================================================================================
+DECLARE @SName AS Varchar(MAX);
+SET @SName = (SELECT primary_replica
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+WHERE primary_replica = @@Servername)
+--SELECT @SName
+;WITH
+    AG_Stats AS
+            (
+            SELECT AR.replica_server_name,
+                   HARS.role_desc, 
+                   Db_name(DRS.database_id) [DBName], 
+                   DRS.last_commit_time
+            FROM   sys.dm_hadr_database_replica_states DRS 
+            INNER JOIN sys.availability_replicas AR ON DRS.replica_id = AR.replica_id 
+            INNER JOIN sys.dm_hadr_availability_replica_states HARS ON AR.group_id = HARS.group_id 
+                AND AR.replica_id = HARS.replica_id 
+            ),
+    Pri_CommitTime AS
+            (
+            SELECT  replica_server_name
+                    , DBName
+                    , last_commit_time
+            FROM    AG_Stats
+            WHERE   role_desc = 'PRIMARY'
+            ),
+    Sec_CommitTime AS
+            (
+            SELECT  replica_server_name
+                    , DBName
+                    , last_commit_time
+            FROM    AG_Stats
+            WHERE   role_desc = 'SECONDARY'
+            )
+SELECT p.replica_server_name [primary_replica]
+    , s.replica_server_name [secondary_replica]
+    , p.[DBName] AS [DatabaseName]
+    ,CASE r.is_database_joined
+        WHEN '0' THEN 'NotJoined'
+        WHEN '1' THEN 'Joined'
+        WHEN NULL THEN 'UnknownState'
+        END AS DBJoined
+    , DATEDIFF(ss,s.last_commit_time,p.last_commit_time) AS [TimeDelay_Sec]
+    ,CASE r.is_failover_ready
+        WHEN '0' THEN 'Not Ready For Failover'
+        WHEN '1' THEN 'Ready For Failover'
+        END AS FailOverStatus
+    ,recovery_lsn
+    FROM Pri_CommitTime p
+INNER JOIN Sec_CommitTime s ON [s].[DBName] = [p].[DBName]
+INNER JOIN sys.dm_hadr_database_replica_cluster_states r ON [p].[DBName] = [r].[database_name]
+WHERE replica_id=(SELECT replica_id FROM sys.availability_replicas WHERE replica_server_name = @SName)
+--AND [r].[database_name] ='' /* filter the database if required */
+=========================================================================================================================================
+2. Script to get the AlwasyOn events using AlwaysOn_Health Extended Events
+set CONCAT_NULL_YIELDS_NULL on
+set ANSI_WARNINGS on
+  
+declare @xel_path varchar(1024);
+declare @utc_adjustment int = datediff(hour, getutcdate(), getdate());
+  
+-------------------------------------------------------------------------------
+------------------- target event_file path retrieval --------------------------
+-------------------------------------------------------------------------------
+;with target_data_cte as
+(
+    select 
+        target_data = 
+            convert(xml, target_data)
+    from sys.dm_xe_sessions s
+    inner join sys.dm_xe_session_targets st
+    on s.address = st.event_session_address
+    where s.name = 'alwayson_health'
+    and st.target_name = 'event_file'
+),
+full_path_cte as
+(
+    select
+        full_path = 
+            target_data.value('(EventFileTarget/File/@name)[1]', 'varchar(1024)')
+    from target_data_cte
+)
+select
+    @xel_path = 
+        left(full_path, len(full_path) - charindex('\', reverse(full_path))) + 
+        '\AlwaysOn_health*.xel'
+from full_path_cte;
+  
+-------------------------------------------------------------------------------
+------------------- replica state change events -------------------------------
+-------------------------------------------------------------------------------
+  
+;with state_change_data as
+(
+    select
+        object_name,
+        event_data = 
+            convert(xml, event_data)
+    from sys.fn_xe_file_target_read_file(@xel_path, null, null, null)
+)
+select
+    'AlwaysOn_AG_State_Change' AS [Information],
+    CONVERT(VARCHAR(20),getdate(),120) AS 'execution_time',
+    [ag_listener] = (SELECT dns_name FROM sys.availability_group_listeners)
+    ,CONVERT(CHAR(100), SERVERPROPERTY('Servername')) AS SQLServer,
+    --,object_name,
+    CONVERT(VARCHAR(20),dateadd(hour, @utc_adjustment, event_data.value('(event/@timestamp)[1]', 'datetime')),120) AS 'event_timestamp',
+    ag_name = 
+        event_data.value('(event/data[@name = "availability_group_name"]/value)[1]', 'varchar(64)'),
+    previous_state = 
+        event_data.value('(event/data[@name = "previous_state"]/text)[1]', 'varchar(64)'),
+    current_state = 
+        event_data.value('(event/data[@name = "current_state"]/text)[1]', 'varchar(64)')
+from state_change_data
+where object_name = 'availability_replica_state_change' AND ISDATE(event_data.value('(event/@timestamp)[1]', 'VARCHAR(64)')) = 1
+order by event_timestamp desc;
+=======================================================================================================================================
+3. Script to get Manual Failover Events using Extended Events
+
+SET NOCOUNT ON
+USE [TempDB]
+GO
+ 
+DECLARE @XELTarget VARCHAR(MAX);
+DECLARE @XELPath VARCHAR(MAX);
+DECLARE @XELFile VARCHAR(max);
+declare @utc_adjustment int = datediff(hour, getutcdate(), getdate());
+ 
+IF EXISTS(SELECT name FROM sys.dm_xe_sessions WHERE name = 'AlwaysOn_Health') BEGIN
+    SELECT @XELTarget = cast(xet.target_data AS XML).value('(EventFileTarget/File/@name)[1]', 'VARCHAR(MAX)') 
+        FROM sys.dm_xe_sessions xes
+        INNER JOIN sys.dm_xe_session_targets xet
+        ON xes.address = xet.event_session_address
+        WHERE xet.target_name = 'event_file' and xes.name = 'AlwaysOn_Health'
+ 
+    SELECT @XELPath = REVERSE(SUBSTRING(REVERSE(@XELTarget), 
+            CHARINDEX('\', reverse(@XELTarget)), 
+            LEN(@XELTarget)+1- CHARINDEX('\', REVERSE(@XELTarget))))
+ 
+    SELECT @XELFile = @XELPath + 'AlwaysOn_health*.xel'
+    IF @XELFile IS NULL BEGIN
+        PRINT 'Unable to find XEVent target files for AlwaysOn_Health XEvent session'
+        PRINT 'Expected AOHealth XEvent files in this location:'
+        PRINT @XELPath
+        RETURN
+    END
+END ELSE BEGIN
+    PRINT 'No AlwaysOn Health XEvent session found'
+    RETURN
+END
+ 
+ 
+--create table
+CREATE TABLE #AOHealth_XELData
+    (ID INT IDENTITY PRIMARY KEY CLUSTERED,
+    object_name varchar(max),
+    EventData XML,
+    file_name varchar(max),
+    file_offset bigint);
+ 
+--read from the files into the table
+IF @XELFile IS NOT NULL BEGIN
+    INSERT INTO #AOHealth_XELData
+    SELECT object_name, cast(event_data as XML) AS EventData,
+      file_name, File_Offset
+      FROM sys.fn_xe_file_target_read_file(
+      @XELFile, NULL, null, null);
+END
+ 
+-- Create table for "error_reported" events
+CREATE TABLE #error_reported (Xevent varchar(15),
+    TimeStamp DATETIME, 
+    error_number INT, 
+    severity INT, 
+    state INT, 
+    user_defined varchar(5),
+    category_desc varchar(25),
+    category varchar(5),
+    destination varchar(20),
+    destination_desc varchar(20),
+    is_intercepted varchar(5),
+    message varchar(max))
+INSERT INTO #error_reported
+SELECT  CAST(object_name as varchar(15)) AS Xevent, 
+    CONVERT(VARCHAR(40),dateadd(hour, @utc_adjustment, EventData.value('(event/@timestamp)[1]', 'datetime')),121) AS TimeStamp,
+    --CAST(object_name as varchar(15)) AS Xevent, EventData.value('(event/@timestamp)[1]', 'datetime') AS TimeStamp,
+    EventData.value('(event/data[@name="error_number"]/value)[1]', 'int') AS error_number,
+    EventData.value('(event/data[@name="severity"]/value)[1]', 'int') AS severity,
+    EventData.value('(event/data[@name="state"]/value)[1]', 'int') AS state,
+    EventData.value('(event/data[@name="user_defined"]/value)[1]', 'varchar(5)') AS user_defined,
+    EventData.value('(event/data[@name="category"]/text)[1]', 'varchar(25)') AS category_desc,
+    EventData.value('(event/data[@name="category"]/value)[1]', 'varchar(5)') AS category,
+    EventData.value('(event/data[@name="destination"]/value)[1]', 'varchar(20)') AS destination,
+    EventData.value('(event/data[@name="destination"]/text)[1]', 'varchar(20)') AS destination_desc,
+    EventData.value('(event/data[@name="is_intercepted"]/value)[1]', 'varchar(5)') AS is_intercepted,
+    EventData.value('(event/data[@name="message"]/value)[1]', 'varchar(max)') AS message
+    FROM #AOHealth_XELData
+    WHERE EventData.value('(event/@name)[1]', 'varchar(max)') = 'error_reported';
+ 
+IF EXISTS(SELECT * FROM #error_reported) BEGIN
+    PRINT 'Error event stats'
+    PRINT '=================';
+    --display results from "error_reported" event data
+    WITH ErrorCTE (ErrorNum, ErrorCount, FirstDate, LastDate) AS (
+    SELECT error_number, Count(error_number), min(TimeStamp), max(TimeStamp) As ErrorCount FROM #error_reported
+        GROUP BY error_number) 
+    SELECT ErrorNum,
+        ErrorCount,--CAST(ErrorCount as CHAR(10)) ErrorCount,
+        CONVERT(CHAR(25), FirstDate,121) FirstDate,
+        CONVERT(CHAR(25), LastDate, 121) LastDate,
+            CAST(CASE ErrorNum 
+            WHEN 35202 THEN 'A connection for availability group ... has been successfully established...'
+            WHEN 1480 THEN 'The %S_MSG database "%.*ls" is changing roles ... because the AG failed over ...'
+            WHEN 35206 THEN 'A connection timeout has occurred on a previously established connection ...'
+            WHEN 35201 THEN 'A connection timeout has occurred while attempting to establish a connection ...'
+            WHEN 41050 THEN 'Waiting for local WSFC service to start.'
+            WHEN 41051 THEN 'Local WSFC service started.'
+            WHEN 41052 THEN 'Waiting for local WSFC node to start.'
+            WHEN 41053 THEN 'Local WSFC node started.'
+            WHEN 41054 THEN 'Waiting for local WSFC node to come online.'
+            WHEN 41055 THEN 'Local WSFC node is online.'
+            WHEN 41048 THEN 'Local WSFC service has become unavailable.'
+            WHEN 41049 THEN 'Local WSFC node is no longer online.'
+            ELSE m.text END AS VARCHAR(81)) [Abbreviated Message]
+         FROM
+        ErrorCTE ec LEFT JOIN sys.messages m on ec.ErrorNum = m.message_id
+        and m.language_id = 1033
+    order by ErrorCount DESC
+END
+ 
+IF EXISTS(SELECT object_name FROM #AOHealth_XELData WHERE object_name = 'alwayson_ddl_executed')
+BEGIN
+        -- Display results "alwayson_ddl_executed" events
+    WITH AODDL (object_name, TimeStamp, ddl_action, ddl_action_desc, ddl_phase, ddl_phase_desc,
+        availability_group_name, [statement])
+    AS
+    (
+        SELECT  object_name, 
+        CONVERT(VARCHAR(40),dateadd(hour, @utc_adjustment, EventData.value('(event/@timestamp)[1]', 'datetime')),121) AS TimeStamp,
+        EventData.value('(event/data[@name="ddl_action"]/value)[1]', 'int') AS ddl_action,
+        EventData.value('(event/data[@name="ddl_action"]/text)[1]', 'varchar(15)') AS ddl_action_desc,
+        EventData.value('(event/data[@name="ddl_phase"]/value)[1]', 'int') AS ddl_phase,
+        EventData.value('(event/data[@name="ddl_phase"]/text)[1]', 'varchar(10)') AS ddl_phase_desc,
+        EventData.value('(event/data[@name="availability_group_name"]/value)[1]', 'varchar(25)') AS availability_group_name,
+        EventData.value('(event/data[@name="statement"]/value)[1]', 'varchar(max)') AS [statement]
+        FROM #AOHealth_XELData
+        WHERE object_name = 'alwayson_ddl_executed'
+            AND (EventData.value('(event/data[@name="statement"]/value)[1]', 'varchar(max)') LIKE '%FAILOVER%'
+                    OR EventData.value('(event/data[@name="statement"]/value)[1]', 'varchar(max)') LIKE '%FORCE%')
+            AND EventData.value('(event/data[@name="statement"]/value)[1]', 'varchar(max)') NOT LIKE '%CREATE%'
+    )
+    SELECT cast(object_name as varchar(22)) AS XEvent, TimeStamp, ddl_action, ddl_action_desc, ddl_phase,
+        ddl_phase_desc, availability_group_name,  
+        CAST(Replace([statement], char(10), '') as varchar(80)) as [statement],'USER EVENT' AS FailoverType
+        FROM AODDL
+        ORDER BY TimeStamp;
+END
+CREATE TABLE #AOHealthSummary (XEvent varchar(50), [COUNT] INT);
+INSERT INTO #AOHealthSummary 
+SELECT CAST(xv.event_name AS VARCHAR(50)), 0
+    FROM sys.dm_xe_sessions xes
+    INNER JOIN sys.dm_xe_session_events xv ON xes.address = xv.event_session_address
+    WHERE xes.name like 'AlwaysOn_Health'
+    ORDER BY event_name;
+ 
+With Summary (XEvent, [Count])
+AS (SELECT CAST(object_name AS VARCHAR(50)) AS [XEvent], count(*) AS [Count] 
+    FROM #AOHealth_XELData
+    GROUP BY object_name)
+UPDATE #AOHealthSummary
+    SET [COUNT] = s.[COUNT] 
+    FROM Summary s
+    INNER JOIN #AOHealthSummary ao ON s.XEvent = ao.XEvent;
+ 
+IF EXISTS(SELECT * FROM #AOHealthSummary) BEGIN
+    PRINT 'Summary event counts for AO Health XEvents'
+    PRINT '==========================================';
+    -- Display event counts for AO Health XEvent data
+    SELECT * FROM #AOHealthSummary
+    ORDER BY [count] DESC, XEvent
+END
+ 
+DROP TABLE #AOHealth_XELData
+DROP TABLE #error_reported
+DROP TABLE #AOHealthSummary
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
