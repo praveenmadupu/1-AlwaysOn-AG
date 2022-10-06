@@ -1,0 +1,58 @@
+SQL Alwayson Preferred Node workaround, Fallback script
+--https://vijredblog.wordpress.com/2017/12/07/sql-alwayson-preferred-node-workaround-fallback-script/
+
+We have Always-On configured between Node-1, Node-2 with Auto Failover enabled. 
+Unfortunately one minor functionality was partially impacted when AG is primary on Node-2.
+
+Business is very particular about not changing it to Manual Failover mode. End up creating a SQL job, scheduled it to run every 10 minutes on Node-1.
+This script moves AG from Node-2 to Node-1 if Node-2 is healthy and in sync.
+
+-- This script can be executed on AG Server. It validates if the server is secondary, connected and healty; If healthy it makes it primary 
+-- This is the Failback job to be configured on SQL AG which needs to be primary
+ 
+-- NOTE: If, Sync mode is Async, Failover parameter needs to be updated to ' FORCE_FAILOVER_ALLOW_DATA_LOSS' ; 
+-- Data movement is suspended on secondary after the execution.
+ 
+
+DECLARE @AGName nvarchar(80) 
+DECLARE @FailoverCommand nvarchar(280) 
+ 
+SET @AGName = 'AGName'
+ 
+ 
+if EXISTS (SELECT 1
+FROM sys.availability_replicas ar 
+inner join sys.dm_hadr_availability_replica_states ags on ar.replica_id=ags.replica_id
+JOIN sys.availability_groups AS ag  ON ag.group_id = ar.group_id
+WHERE name = @AGName
+AND is_local = 1 -- LocalReplica
+AND ROLE = 2 -- Secondary 
+AND connected_state = 1 -- CONNECTED
+AND synchronization_health = 2 -- HEALTHY
+)
+BEGIN
+    SET @FailoverCommand = 'ALTER AVAILABILITY GROUP ' + @AGName + ' FAILOVER' -- ' FORCE_FAILOVER_ALLOW_DATA_LOSS' 
+    EXEC (@FailoverCommand)
+    PRINT 'AG '+ @AGName +' has been failed over to ' + @@SERVERNAME 
+END
+ELSE
+BEGIN
+ 
+    if EXISTS (SELECT 1
+    FROM sys.availability_replicas               ar 
+    inner join sys.dm_hadr_availability_replica_states ags on ar.replica_id=ags.replica_id
+    JOIN sys.availability_groups AS ag  ON ag.group_id = ar.group_id
+    WHERE name = @AGName
+    AND is_local = 1 -- LocalReplica
+    AND ROLE = 2 -- Secondary 
+    )
+    BEGIN  
+        PRINT 'Failover of AG '+ @AGName +' not attempted as AG is not connected or not Healthy on ' + @@SERVERNAME 
+    END
+    ELSE
+    BEGIN
+        PRINT 'AG '+ @AGName +' is Primary, Failover was not attempted on ' + @@SERVERNAME 
+    END
+END
+ 
+--
