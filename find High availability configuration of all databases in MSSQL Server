@@ -1,0 +1,91 @@
+find High availability configuration of all databases in MSSQL Server
+
+TSQL to find list of all databases in MSSQL Server with Always-ON and mirroring configuration.
+
+--
+-- TSQL to find the High availability configuration of all databases 
+-- Created by Vijay 
+-- Created on 4/25/2019 
+ 
+IF OBJECT_ID('tempdb..#DatabaseInfo') IS NOT NULL
+    DROP TABLE #DatabaseInfo
+ 
+SELECT
+    ISNULL(ar.replica_server_name,@@SERVERNAME) AS AG_replica_server_name, 
+    d.name AS database_name,
+    ars.role_desc AS AG_role_desc,
+    ag.name AS ag_name, 
+    -- drs.is_local AS ag_is_local, 
+    --drs.is_primary_replica, 
+    drs.synchronization_state_desc AS AG_synchronization_state_desc, 
+    drs.is_commit_participant AS AG_is_commit_participant, 
+    availability_mode_desc AS AG_availability_mode_desc,
+    failover_mode_desc AS AG_failover_mode_desc,
+    dm.mirroring_role_desc,dm.mirroring_state_desc,dm.mirroring_partner_instance,dm.mirroring_safety_level_desc
+    INTO #DatabaseInfo
+FROM sys.dm_hadr_database_replica_states AS drs
+INNER JOIN sys.availability_databases_cluster AS adc 
+    ON drs.group_id = adc.group_id AND
+    drs.group_database_id = adc.group_database_id
+INNER JOIN sys.availability_groups AS ag
+    ON ag.group_id = drs.group_id
+INNER JOIN sys.availability_replicas AS ar 
+    ON drs.group_id = ar.group_id AND
+    drs.replica_id = ar.replica_id
+INNER JOIN sys.dm_hadr_availability_replica_states  AS ars 
+    ON ars.replica_id = drs.replica_id AND ars.group_id = drs.group_id
+RIGHT JOIN sys.databases d ON d.name = adc.database_name
+LEFT JOIN sys.database_mirroring  dm on dm.database_id = d.database_id
+WHERE d.name not in ('master', 'tempdb', 'model', 'msdb')
+AND ISNULL(drs.is_local,1) = 1 
+ 
+ 
+SELECT 'AllDatabaseConfiguration' as Tableinfo, * FROM #DatabaseInfo 
+ORDER BY
+    AG_failover_mode_desc,
+    ag_name, 
+    database_name,
+    AG_replica_server_name;
+ 
+ 
+SELECT 'StandaloneDatabases on Server' as Tableinfo_Standalone, * FROM #DatabaseInfo 
+WHERE AG_role_desc IS NULL AND mirroring_role_desc IS NULL
+ORDER BY database_name
+ 
+ 
+SELECT 'Availability Group Manual Failover configuration' as Tableinfo_AG_ManualFailover, * FROM #DatabaseInfo 
+WHERE AG_failover_mode_desc = 'MANUAL'
+ORDER BY
+    AG_failover_mode_desc,
+    ag_name, 
+    database_name,
+    AG_replica_server_name;
+ 
+ 
+ 
+SELECT 'Availability Group Automatic Failover configuration' as Tableinfo_AG_AutomaticFailover, * FROM #DatabaseInfo 
+WHERE AG_failover_mode_desc = 'AUTOMATIC'
+ORDER BY
+    AG_failover_mode_desc,
+    ag_name, 
+    database_name,
+    AG_replica_server_name;
+ 
+     
+ 
+SELECT 'Mirroring databases - Manual action required during DR' as Tableinfo_MirroringDatabases, * FROM #DatabaseInfo 
+WHERE   mirroring_role_desc is NOT NULL
+ORDER BY
+    AG_failover_mode_desc,
+    ag_name, 
+    database_name,
+    AG_replica_server_name;
+ 
+ 
+select DISTINCT ISNULL(replica_server_name,@@SERVERNAME) AS Servers_InCluster from sys.availability_replicas
+UNION
+SELECT DISTINCT ISNULL(mirroring_partner_instance,@@SERVERNAME) AS Servers_InCluster FROM sys.database_mirroring
+ 
+IF OBJECT_ID('tempdb..#DatabaseInfo') IS NOT NULL
+    DROP TABLE #DatabaseInfo
+--
