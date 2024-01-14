@@ -1,0 +1,94 @@
+Applying patches in a SQL Server Always On Availability Group environment requires careful planning to minimize downtime and ensure a smooth update process. 
+Here are the general steps to apply a SQL Server patch in an Always On Availability Group environment:
+
+### 1. **Prepare for Maintenance:**
+
+- **Notify Stakeholders:**
+  - Inform stakeholders about the planned maintenance window for applying the patch.
+
+- **Backup Databases:**
+  - Perform a full backup of all databases in the Availability Group on the primary replica.
+
+- **Monitor Replication:**
+  - Ensure that data replication is healthy, and there are no synchronization issues between replicas.
+
+### 2. **Plan for Downtime:**
+
+- **Schedule Maintenance Window:**
+  - Choose a suitable maintenance window to minimize the impact on users.
+
+- **Plan for Failover:**
+  - Decide whether you will perform a manual failover or allow automatic failover during the patching process.
+
+### 3. **Failover to Secondary Replica:**
+
+- **Manual Failover:**
+  - If planned, initiate a manual failover to one of the secondary replicas.
+  - Connect applications to the new primary replica.
+
+- **Automatic Failover:**
+  - If automatic failover is preferred, ensure that it's configured appropriately.
+
+### 4. **Patch the Secondary Replica:**
+
+- **Install the Patch:**
+  - On the secondary replica, apply the SQL Server patch following the vendor's instructions.
+  - Ensure the patch version matches the existing primary replica version.
+
+- **Validate Installation:**
+  - Verify that the patch installation on the secondary replica was successful.
+  - Confirm that databases are accessible and replication is functioning.
+
+### 5. **Failover Back to Original Primary Replica:**
+
+- **Manual Failover:**
+  - If a manual failover was initiated, perform a failback to the original primary replica.
+  - Reconnect applications to the restored primary replica.
+
+- **Automatic Failover:**
+  - If automatic failover is enabled, allow it to occur if necessary.
+
+### 6. **Patch the Original Primary Replica:**
+
+- **Install the Patch:**
+  - On the original primary replica (now secondary), apply the SQL Server patch.
+  - Follow the same steps as applied to the secondary replica.
+
+- **Validate Installation:**
+  - Verify the successful installation of the patch.
+  - Confirm that databases are accessible and replication is functioning.
+
+### 7. **Reconfigure Automatic Failover:**
+
+- **Adjust Automatic Failover Settings:**
+  - If automatic failover was temporarily disabled, reconfigure it according to your preferences.
+
+### 8. **Post-Patching Validation:**
+
+- **Monitor Replication:**
+  - Ensure that data replication is healthy after the patching process.
+
+- **Application Testing:**
+  - Test critical applications to ensure they can connect to the primary replica and function as expected.
+
+- **Performance Testing:**
+  - Perform performance testing to identify any potential issues introduced by the patch.
+
+### 9. **Communicate Completion:**
+
+- **Notify Stakeholders:**
+  - Inform stakeholders that the patching process is complete and confirm the success of the update.
+
+### Additional Considerations:
+
+- **Availability Group Listeners:**
+  - If you are using an Availability Group listener, ensure that it's functioning correctly after the patching process.
+
+- **Backup and Restore Certificates (if applicable):**
+  - If Transparent Data Encryption (TDE) is in use, ensure that certificates and keys are backed up and restored appropriately.
+
+- **Documentation:**
+  - Update documentation to reflect the new patch version and the date of the update.
+
+Always refer to the specific documentation provided by Microsoft and the patch vendor for detailed instructions on applying patches to your SQL Server version. 
+Ensure that you thoroughly test the patch in a non-production environment before applying it to your production systems.
